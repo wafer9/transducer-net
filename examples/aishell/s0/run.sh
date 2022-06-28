@@ -11,8 +11,8 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
 # export NCCL_SOCKET_IFNAME=ens4f1
 export NCCL_DEBUG=INFO
-stage=0 # start from 0 if you need to start from data preparation
-stop_stage=6
+stage=2 # start from 0 if you need to start from data preparation
+stop_stage=3
 # The num of nodes or machines used for multi-machine training
 # Default 1 for single machine/node
 # NFS will be needed if you want run multi-machine training
@@ -22,7 +22,7 @@ num_nodes=1
 # the third one set node_rank 2, and so on. Default 0
 node_rank=0
 # data
-data=/export/data/asr-data/OpenSLR/33/
+data=/data1/wangzhou/data/aishell_set
 data_url=www.openslr.org/resources/33
 
 nj=16
@@ -71,15 +71,11 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
             > data/${x}/text
         rm data/${x}/text.org
     done
-    # For wav feature, just copy the data. Fbank extraction is done in training
-    mkdir -p $feat_dir
-    for x in ${train_set} dev test; do
-        cp -r data/$x $feat_dir
-    done
+
 
     tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
         --in_scp data/${train_set}/wav.scp \
-        --out_cmvn $feat_dir/$train_set/global_cmvn
+        --out_cmvn data/${train_set}/global_cmvn
 
 fi
 
@@ -100,17 +96,8 @@ if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     # Prepare wenet requried data
     echo "Prepare data, prepare requried format"
     for x in dev test ${train_set}; do
-        tools/format_data.sh --nj ${nj} \
-            --feat-type wav --feat $feat_dir/$x/wav.scp \
-            $feat_dir/$x ${dict} > $feat_dir/$x/format.data.tmp
-
-        tools/remove_longshortdata.py \
-            --min_input_len 0.5 \
-            --max_input_len 20 \
-            --max_output_len 400 \
-            --max_output_input_ratio 10.0 \
-            --data_file $feat_dir/$x/format.data.tmp \
-            --output_data_file $feat_dir/$x/format.data
+      tools/make_raw_list.py data/$x/wav.scp data/$x/text \
+        data/$x/data.list
     done
 fi
 
@@ -133,7 +120,7 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     world_size=`expr $num_gpus \* $num_nodes`
     echo "total gpus is: $world_size"
     cmvn_opts=
-    $cmvn && cp ${feat_dir}/${train_set}/global_cmvn $dir
+    $cmvn && cp data/${train_set}/global_cmvn $dir
     $cmvn && cmvn_opts="--cmvn ${dir}/global_cmvn"
     # train.py will write $train_config to $dir/train.yaml with model input
     # and output dimension, train.yaml will be used for inference or model
@@ -146,8 +133,9 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
         rank=`expr $node_rank \* $num_gpus + $i`
         python wenet/bin/train.py --gpu $gpu_id \
             --config $train_config \
-            --train_data $feat_dir/$train_set/format.data \
-            --cv_data $feat_dir/dev/format.data \
+            --symbol_table $dict \
+            --train_data data/$train_set/data.list \
+            --cv_data data/dev/data.list \
             ${checkpoint:+--checkpoint $checkpoint} \
             --model_dir $dir \
             --ddp.init_method $init_method \

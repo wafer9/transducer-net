@@ -8,6 +8,15 @@ from torch.nn.utils.rnn import pad_sequence
 
 IGNORE_ID = -1
 
+def read_symbol_table(symbol_table_file):
+    symbol_table = {}
+    with open(symbol_table_file, 'r', encoding='utf8') as fin:
+        for line in fin:
+            arr = line.strip().split()
+            assert len(arr) == 2
+            symbol_table[arr[0]] = int(arr[1])
+    return symbol_table
+
 
 def pad_list(xs: List[torch.Tensor], pad_value: int):
     """Perform padding for the list of tensors.

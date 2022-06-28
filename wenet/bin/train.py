@@ -31,6 +31,7 @@ from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import load_checkpoint, save_checkpoint
 from wenet.utils.executor import Executor
 from wenet.utils.scheduler import WarmupLR
+from wenet.utils.common import read_symbol_table
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='training your network')
@@ -79,7 +80,9 @@ if __name__ == '__main__':
                         default=False,
                         help='Use automatic mixed precision training')
     parser.add_argument('--cmvn', default=None, help='global cmvn file')
-
+    parser.add_argument('--symbol_table',
+                        required=True,
+                        help='model unit symbol table for training')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG,
@@ -92,6 +95,7 @@ if __name__ == '__main__':
         configs = yaml.load(fin, Loader=yaml.FullLoader)
 
     distributed = args.world_size > 1
+    symbol_table = read_symbol_table(args.symbol_table)
 
     raw_wav = configs['raw_wav']
 
