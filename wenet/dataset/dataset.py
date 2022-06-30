@@ -33,6 +33,7 @@ from torch.utils.data import Dataset, DataLoader
 import wenet.dataset.kaldi_io as kaldi_io
 from wenet.dataset.wav_distortion import distort_wav_conf
 from wenet.utils.common import IGNORE_ID
+import kaldiio
 
 torchaudio.set_audio_backend("sox_io")
 
@@ -261,7 +262,7 @@ def _extract_feature(batch, speed_perturb, wav_distortion_conf,
     order = np.argsort(lengths)[::-1]
     sorted_keys = [keys[i] for i in order]
     sorted_feats = [feats[i] for i in order]
-    labels = [x[2].split() for x in batch]
+    labels = [x[3].split() for x in batch]
     labels = [np.fromiter(map(int, x), dtype=np.int32) for x in labels]
     sorted_labels = [labels[i] for i in order]
     return sorted_keys, sorted_feats, sorted_labels
@@ -283,7 +284,8 @@ def _load_feature(batch):
     lengths = []
     for i, x in enumerate(batch):
         try:
-            mat = kaldi_io.read_mat(x[1])
+            #mat = kaldi_io.read_mat(x[1])
+            mat = kaldiio.load_mat(x[1])
             feats.append(mat)
             keys.append(x[0])
             lengths.append(mat.shape[0])
@@ -294,7 +296,7 @@ def _load_feature(batch):
     order = np.argsort(lengths)[::-1]
     sorted_keys = [keys[i] for i in order]
     sorted_feats = [feats[i] for i in order]
-    labels = [x[2].split() for x in batch]
+    labels = [x[3].split() for x in batch]
     labels = [np.fromiter(map(int, x), dtype=np.int32) for x in labels]
     sorted_labels = [labels[i] for i in order]
     return sorted_keys, sorted_feats, sorted_labels
@@ -453,7 +455,8 @@ class AudioDataset(Dataset):
                     self.input_dim = feat_dim
                 self.output_dim = output_dim
         if sort:
-            data = sorted(data, key=lambda x: x[2])
+            data = sorted(data, key=lambda x: x[0])
+            data = sorted(data, key=lambda x: x[2], reverse=True)
         valid_data = []
         for i in range(len(data)):
             length = data[i][2]
@@ -470,29 +473,31 @@ class AudioDataset(Dataset):
                 valid_data.append(data[i])
         data = valid_data
         self.minibatch = []
-        num_data = len(data)
-        # Dynamic batch size
-        if batch_type == 'dynamic':
-            assert (max_frames_in_batch > 0)
-            self.minibatch.append([])
-            num_frames_in_batch = 0
-            for i in range(num_data):
-                length = data[i][2]
-                num_frames_in_batch += length
-                if num_frames_in_batch > max_frames_in_batch:
-                    self.minibatch.append([])
-                    num_frames_in_batch = length
-                self.minibatch[-1].append((data[i][0], data[i][1], data[i][3]))
-        # Static batch size
-        else:
-            cur = 0
-            while cur < num_data:
-                end = min(cur + batch_size, num_data)
-                item = []
-                for i in range(cur, end):
-                    item.append((data[i][0], data[i][1], data[i][3]))
-                self.minibatch.append(item)
-                cur = end
+        start = 0
+        max_length_in = 512.0 # frame
+        max_length_out = 150.0
+        min_batch_size = 1
+        while True:
+            ilen = data[start][2]
+            olen = len(data[start][3].split())
+            factor = max(int(ilen / max_length_in), int(olen / max_length_out))
+            bs = max(min_batch_size, int(batch_size / (1 + factor)))
+            end = min(len(data), start + bs)
+            minibatch = data[start:end]
+
+            # check each batch is more than minimum batchsize
+            if len(minibatch) < min_batch_size:
+                mod = min_batch_size - len(minibatch) % min_batch_size
+                additional_minibatch = [
+                    data[i] for i in np.random.randint(0, start, mod)
+                ]
+                minibatch.extend(additional_minibatch)
+            self.minibatch.append(minibatch)
+
+            if end == len(data):
+                break
+            start = end
+        end = 0
 
     def __len__(self):
         return len(self.minibatch)

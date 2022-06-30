@@ -25,14 +25,18 @@ from wenet.transformer.decoder import (TransformerDecoder,
                                        BiTransformerDecoder)
 from wenet.transformer.encoder import ConformerEncoder
 from wenet.transformer.encoder import TransformerEncoder
+from wenet.transformer.rnn_decoder import RNNDecoder
+from wenet.transformer.joint_network import JointNetwork
 from wenet.transformer.label_smoothing_loss import LabelSmoothingLoss
 from wenet.utils.cmvn import load_cmvn
 from wenet.utils.common import (IGNORE_ID, add_sos_eos, log_add,
                                 remove_duplicates_and_blank, th_accuracy,
-                                reverse_pad_list)
+                                reverse_pad_list, prepare_loss_inputs)
 from wenet.utils.mask import (make_pad_mask, mask_finished_preds,
                               mask_finished_scores, subsequent_mask)
-
+from warprnnt_pytorch import RNNTLoss
+from wenet.utils.common import Hypothesis
+from wenet.utils.common import initializer
 
 class ASRModel(torch.nn.Module):
     """CTC-attention hybrid Encoder-Decoder model"""
@@ -40,8 +44,9 @@ class ASRModel(torch.nn.Module):
         self,
         vocab_size: int,
         encoder: TransformerEncoder,
-        decoder: TransformerDecoder,
+        predictor: RNNDecoder,
         ctc: CTC,
+        joint_network: JointNetwork,
         ctc_weight: float = 0.5,
         ignore_id: int = IGNORE_ID,
         reverse_weight: float = 0.0,
@@ -54,19 +59,20 @@ class ASRModel(torch.nn.Module):
         # note that eos is the same as sos (equivalent ID)
         self.sos = vocab_size - 1
         self.eos = vocab_size - 1
+        self.blank_id = 0
         self.vocab_size = vocab_size
         self.ignore_id = ignore_id
         self.ctc_weight = ctc_weight
         self.reverse_weight = reverse_weight
 
         self.encoder = encoder
-        self.decoder = decoder
+        self.predictor = predictor
         self.ctc = ctc
-        self.criterion_att = LabelSmoothingLoss(
-            size=vocab_size,
-            padding_idx=ignore_id,
-            smoothing=lsm_weight,
-            normalize_length=length_normalized_loss,
+        self.joint_network = joint_network
+        self.transducer_loss = RNNTLoss(
+            blank=self.blank_id,
+            reduction="sum",
+            fastemit_lambda=0.0,
         )
 
     def forward(
@@ -96,10 +102,20 @@ class ASRModel(torch.nn.Module):
 
         # 2a. Attention-decoder branch
         if self.ctc_weight != 1.0:
-            loss_att, acc_att = self._calc_att_loss(encoder_out, encoder_mask,
-                                                    text, text_lengths)
+            predict_ys_in_pad, target, target_len = prepare_loss_inputs(text, encoder_mask)
+            self.predictor.set_device(encoder_out.device)
+            predictor_out = self.predictor(predict_ys_in_pad)
+            h_enc = encoder_out.unsqueeze(2)
+            h_dec = predictor_out.unsqueeze(1)
+            joint_out = self.joint_network(h_enc, h_dec)
+            #log_probs = torch.log_softmax(z, dim=-1)
+
+            target = target.to(dtype=torch.int32)
+            encoder_out_lens = encoder_out_lens.to(dtype=torch.int32)
+            loss_trans = self.transducer_loss(joint_out, target, encoder_out_lens, target_len)
+            loss_trans /= joint_out.size(0)
         else:
-            loss_att = None
+            loss_trans = None
 
         # 2b. CTC branch
         if self.ctc_weight != 0.0:
@@ -109,47 +125,12 @@ class ASRModel(torch.nn.Module):
             loss_ctc = None
 
         if loss_ctc is None:
-            loss = loss_att
-        elif loss_att is None:
+            loss = loss_trans
+        elif loss_trans is None:
             loss = loss_ctc
         else:
-            loss = self.ctc_weight * loss_ctc + (1 -
-                                                 self.ctc_weight) * loss_att
-        return loss, loss_att, loss_ctc
-
-    def _calc_att_loss(
-        self,
-        encoder_out: torch.Tensor,
-        encoder_mask: torch.Tensor,
-        ys_pad: torch.Tensor,
-        ys_pad_lens: torch.Tensor,
-    ) -> Tuple[torch.Tensor, float]:
-        ys_in_pad, ys_out_pad = add_sos_eos(ys_pad, self.sos, self.eos,
-                                            self.ignore_id)
-        ys_in_lens = ys_pad_lens + 1
-
-        # reverse the seq, used for right to left decoder
-        r_ys_pad = reverse_pad_list(ys_pad, ys_pad_lens, float(self.ignore_id))
-        r_ys_in_pad, r_ys_out_pad = add_sos_eos(r_ys_pad, self.sos, self.eos,
-                                                self.ignore_id)
-        # 1. Forward decoder
-        decoder_out, r_decoder_out, _ = self.decoder(encoder_out, encoder_mask,
-                                                     ys_in_pad, ys_in_lens,
-                                                     r_ys_in_pad,
-                                                     self.reverse_weight)
-        # 2. Compute attention loss
-        loss_att = self.criterion_att(decoder_out, ys_out_pad)
-        r_loss_att = torch.tensor(0.0)
-        if self.reverse_weight > 0.0:
-            r_loss_att = self.criterion_att(r_decoder_out, r_ys_out_pad)
-        loss_att = loss_att * (
-            1 - self.reverse_weight) + r_loss_att * self.reverse_weight
-        acc_att = th_accuracy(
-            decoder_out.view(-1, self.vocab_size),
-            ys_out_pad,
-            ignore_label=self.ignore_id,
-        )
-        return loss_att, acc_att
+            loss = self.ctc_weight * loss_ctc + loss_trans
+        return loss, loss_trans, loss_ctc
 
     def _forward_encoder(
         self,
@@ -175,112 +156,6 @@ class ASRModel(torch.nn.Module):
                 num_decoding_left_chunks=num_decoding_left_chunks
             )  # (B, maxlen, encoder_dim)
         return encoder_out, encoder_mask
-
-    def recognize(
-        self,
-        speech: torch.Tensor,
-        speech_lengths: torch.Tensor,
-        beam_size: int = 10,
-        decoding_chunk_size: int = -1,
-        num_decoding_left_chunks: int = -1,
-        simulate_streaming: bool = False,
-    ) -> torch.Tensor:
-        """ Apply beam search on attention decoder
-
-        Args:
-            speech (torch.Tensor): (batch, max_len, feat_dim)
-            speech_length (torch.Tensor): (batch, )
-            beam_size (int): beam size for beam search
-            decoding_chunk_size (int): decoding chunk for dynamic chunk
-                trained model.
-                <0: for decoding, use full chunk.
-                >0: for decoding, use fixed chunk size as set.
-                0: used for training, it's prohibited here
-            simulate_streaming (bool): whether do encoder forward in a
-                streaming fashion
-
-        Returns:
-            torch.Tensor: decoding result, (batch, max_result_len)
-        """
-        assert speech.shape[0] == speech_lengths.shape[0]
-        assert decoding_chunk_size != 0
-        device = speech.device
-        batch_size = speech.shape[0]
-
-        # Let's assume B = batch_size and N = beam_size
-        # 1. Encoder
-        encoder_out, encoder_mask = self._forward_encoder(
-            speech, speech_lengths, decoding_chunk_size,
-            num_decoding_left_chunks,
-            simulate_streaming)  # (B, maxlen, encoder_dim)
-        maxlen = encoder_out.size(1)
-        encoder_dim = encoder_out.size(2)
-        running_size = batch_size * beam_size
-        encoder_out = encoder_out.unsqueeze(1).repeat(1, beam_size, 1, 1).view(
-            running_size, maxlen, encoder_dim)  # (B*N, maxlen, encoder_dim)
-        encoder_mask = encoder_mask.unsqueeze(1).repeat(
-            1, beam_size, 1, 1).view(running_size, 1,
-                                     maxlen)  # (B*N, 1, max_len)
-
-        hyps = torch.ones([running_size, 1], dtype=torch.long,
-                          device=device).fill_(self.sos)  # (B*N, 1)
-        scores = torch.tensor([0.0] + [-float('inf')] * (beam_size - 1),
-                              dtype=torch.float)
-        scores = scores.to(device).repeat([batch_size]).unsqueeze(1).to(
-            device)  # (B*N, 1)
-        end_flag = torch.zeros_like(scores, dtype=torch.bool, device=device)
-        cache: Optional[List[torch.Tensor]] = None
-        # 2. Decoder forward step by step
-        for i in range(1, maxlen + 1):
-            # Stop if all batch and all beam produce eos
-            if end_flag.sum() == running_size:
-                break
-            # 2.1 Forward decoder step
-            hyps_mask = subsequent_mask(i).unsqueeze(0).repeat(
-                running_size, 1, 1).to(device)  # (B*N, i, i)
-            # logp: (B*N, vocab)
-            logp, cache = self.decoder.forward_one_step(
-                encoder_out, encoder_mask, hyps, hyps_mask, cache)
-            # 2.2 First beam prune: select topk best prob at current time
-            top_k_logp, top_k_index = logp.topk(beam_size)  # (B*N, N)
-            top_k_logp = mask_finished_scores(top_k_logp, end_flag)
-            top_k_index = mask_finished_preds(top_k_index, end_flag, self.eos)
-            # 2.3 Second beam prune: select topk score with history
-            scores = scores + top_k_logp  # (B*N, N), broadcast add
-            scores = scores.view(batch_size, beam_size * beam_size)  # (B, N*N)
-            scores, offset_k_index = scores.topk(k=beam_size)  # (B, N)
-            scores = scores.view(-1, 1)  # (B*N, 1)
-            # 2.4. Compute base index in top_k_index,
-            # regard top_k_index as (B*N*N),regard offset_k_index as (B*N),
-            # then find offset_k_index in top_k_index
-            base_k_index = torch.arange(batch_size, device=device).view(
-                -1, 1).repeat([1, beam_size])  # (B, N)
-            base_k_index = base_k_index * beam_size * beam_size
-            best_k_index = base_k_index.view(-1) + offset_k_index.view(
-                -1)  # (B*N)
-
-            # 2.5 Update best hyps
-            best_k_pred = torch.index_select(top_k_index.view(-1),
-                                             dim=-1,
-                                             index=best_k_index)  # (B*N)
-            best_hyps_index = best_k_index // beam_size
-            last_best_k_hyps = torch.index_select(
-                hyps, dim=0, index=best_hyps_index)  # (B*N, i)
-            hyps = torch.cat((last_best_k_hyps, best_k_pred.view(-1, 1)),
-                             dim=1)  # (B*N, i+1)
-
-            # 2.6 Update end flag
-            end_flag = torch.eq(hyps[:, -1], self.eos).view(-1, 1)
-
-        # 3. Select best of best
-        scores = scores.view(batch_size, beam_size)
-        # TODO: length normalization
-        best_index = torch.argmax(scores, dim=-1).long()
-        best_hyps_index = best_index + torch.arange(
-            batch_size, dtype=torch.long, device=device) * beam_size
-        best_hyps = torch.index_select(hyps, dim=0, index=best_hyps_index)
-        best_hyps = best_hyps[:, 1:]
-        return best_hyps
 
     def ctc_greedy_search(
         self,
@@ -443,20 +318,15 @@ class ASRModel(torch.nn.Module):
                                                simulate_streaming)
         return hyps[0][0]
 
-    def attention_rescoring(
+    def trans_greedy_search(
         self,
         speech: torch.Tensor,
         speech_lengths: torch.Tensor,
-        beam_size: int,
         decoding_chunk_size: int = -1,
         num_decoding_left_chunks: int = -1,
-        ctc_weight: float = 0.0,
         simulate_streaming: bool = False,
-        reverse_weight: float = 0.0,
-    ) -> List[int]:
-        """ Apply attention rescoring decoding, CTC prefix beam search
-            is applied first to get nbest, then we resoring the nbest on
-            attention decoder with corresponding encoder out
+    ) -> List[List[int]]:
+        """ Apply CTC greedy search
 
         Args:
             speech (torch.Tensor): (batch, max_len, feat_dim)
@@ -469,77 +339,42 @@ class ASRModel(torch.nn.Module):
                 0: used for training, it's prohibited here
             simulate_streaming (bool): whether do encoder forward in a
                 streaming fashion
-            reverse_weight (float): right to left decoder weight
-            ctc_weight (float): ctc score weight
-
         Returns:
-            List[int]: Attention rescoring result
+            List[List[int]]: best path result
         """
         assert speech.shape[0] == speech_lengths.shape[0]
         assert decoding_chunk_size != 0
-        if reverse_weight > 0.0:
-            # decoder should be a bitransformer decoder if reverse_weight > 0.0
-            assert hasattr(self.decoder, 'right_decoder')
         device = speech.device
         batch_size = speech.shape[0]
-        # For attention rescoring we only support batch_size=1
-        assert batch_size == 1
-        # encoder_out: (1, maxlen, encoder_dim), len(hyps) = beam_size
-        hyps, encoder_out = self._ctc_prefix_beam_search(
-            speech, speech_lengths, beam_size, decoding_chunk_size,
-            num_decoding_left_chunks, simulate_streaming)
+        # Let's assume B = batch_size
+        encoder_out, encoder_mask = self._forward_encoder(
+            speech, speech_lengths, decoding_chunk_size,
+            num_decoding_left_chunks,
+            simulate_streaming)  # (B, maxlen, encoder_dim)
 
-        assert len(hyps) == beam_size
-        hyps_pad = pad_sequence([
-            torch.tensor(hyp[0], device=device, dtype=torch.long)
-            for hyp in hyps
-        ], True, self.ignore_id)  # (beam_size, max_hyps_len)
-        ori_hyps_pad = hyps_pad
-        hyps_lens = torch.tensor([len(hyp[0]) for hyp in hyps],
-                                 device=device,
-                                 dtype=torch.long)  # (beam_size,)
-        hyps_pad, _ = add_sos_eos(hyps_pad, self.sos, self.eos, self.ignore_id)
-        hyps_lens = hyps_lens + 1  # Add <sos> at begining
-        encoder_out = encoder_out.repeat(beam_size, 1, 1)
-        encoder_mask = torch.ones(beam_size,
-                                  1,
-                                  encoder_out.size(1),
-                                  dtype=torch.bool,
-                                  device=device)
-        # used for right to left decoder
-        r_hyps_pad = reverse_pad_list(ori_hyps_pad, hyps_lens, self.ignore_id)
-        r_hyps_pad, _ = add_sos_eos(r_hyps_pad, self.sos, self.eos,
-                                    self.ignore_id)
-        decoder_out, r_decoder_out, _ = self.decoder(
-            encoder_out, encoder_mask, hyps_pad, hyps_lens, r_hyps_pad,
-            reverse_weight)  # (beam_size, max_hyps_len, vocab_size)
-        decoder_out = torch.nn.functional.log_softmax(decoder_out, dim=-1)
-        decoder_out = decoder_out.cpu().numpy()
-        # r_decoder_out will be 0.0, if reverse_weight is 0.0 or decoder is a
-        # conventional transformer decoder.
-        r_decoder_out = torch.nn.functional.log_softmax(r_decoder_out, dim=-1)
-        r_decoder_out = r_decoder_out.cpu().numpy()
-        # Only use decoder score for rescoring
-        best_score = -float('inf')
-        best_index = 0
-        for i, hyp in enumerate(hyps):
-            score = 0.0
-            for j, w in enumerate(hyp[0]):
-                score += decoder_out[i][j][w]
-            score += decoder_out[i][len(hyp[0])][self.eos]
-            # add right to left decoder score
-            if reverse_weight > 0:
-                r_score = 0.0
-                for j, w in enumerate(hyp[0]):
-                    r_score += r_decoder_out[i][len(hyp[0]) - j - 1][w]
-                r_score += r_decoder_out[i][len(hyp[0])][self.eos]
-                score = score * (1 - reverse_weight) + r_score * reverse_weight
-            # add ctc score
-            score += hyp[1] * ctc_weight
-            if score > best_score:
-                best_score = score
-                best_index = i
-        return hyps[best_index][0]
+        h = encoder_out.squeeze(0)
+        
+        self.predictor.set_device(encoder_out.device)
+        dec_state = self.predictor.init_state(1)
+
+        hyp = Hypothesis(score=0.0, yseq=[self.blank_id], dec_state=dec_state)
+        cache = {}
+
+        dec_out, state, _ = self.predictor.score(hyp, cache)
+
+        for i, hi in enumerate(h):
+            logp = torch.log_softmax(self.joint_network(hi, dec_out), dim=-1)
+            top_logp, pred = torch.max(logp, dim=-1)
+
+            if pred != self.blank_id:
+                #print(i * 4, pred)
+                hyp.yseq.append(int(pred))
+                hyp.score += float(top_logp)
+
+                hyp.dec_state = state
+
+                dec_out, state, _ = self.predictor.score(hyp, cache)
+        return hyp.yseq
 
     @torch.jit.export
     def subsampling_rate(self) -> int:
@@ -687,6 +522,7 @@ def init_asr_model(configs):
 
     input_dim = configs['input_dim']
     vocab_size = configs['output_dim']
+    joint_dim = configs['joint_dim']
 
     encoder_type = configs.get('encoder', 'conformer')
     decoder_type = configs.get('decoder', 'bitransformer')
@@ -707,12 +543,19 @@ def init_asr_model(configs):
         assert configs['decoder_conf']['r_num_blocks'] > 0
         decoder = BiTransformerDecoder(vocab_size, encoder.output_size(),
                                        **configs['decoder_conf'])
-    ctc = CTC(vocab_size, encoder.output_size())
+    predictor = RNNDecoder(odim=vocab_size, **configs['decoder_lstm_conf'])
+    joint_network = JointNetwork(vocab_size, encoder.output_size(), 
+                                    encoder.output_size(), joint_dim)
+    
+    ctc = CTC(vocab_size, encoder.output_size(), dropout_rate=0.1)
     model = ASRModel(
         vocab_size=vocab_size,
         encoder=encoder,
-        decoder=decoder,
+        predictor=predictor,
         ctc=ctc,
+        joint_network=joint_network,
         **configs['model_conf'],
     )
+    model = initializer(model)
+
     return model

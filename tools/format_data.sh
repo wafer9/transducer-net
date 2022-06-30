@@ -83,8 +83,9 @@ if [ -n "${feat}" ]; then
                 awk '{print $1" "$4-$3}' $dir/segments > $dir/utt2dur
             fi
             if [ ! -f $dir/utt2dur ]; then
-                tools/wav_to_duration.sh --nj ${nj} \
-                    ${feat} ${tmpdir}/input_${i}/shape.scp
+                #tools/wav_to_duration.sh --nj ${nj} \
+                #    ${feat} ${tmpdir}/input_${i}/shape.scp
+                tools/wav2dur.py ${feat} ${tmpdir}/input_${i}/shape.scp
             # use the existed utt2dur as shape.scp directly
             else
                 cp $dir/utt2dur ${tmpdir}/input_${i}/shape.scp

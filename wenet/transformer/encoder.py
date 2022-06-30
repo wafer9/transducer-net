@@ -22,10 +22,12 @@ from wenet.transformer.subsampling import Conv2dSubsampling4
 from wenet.transformer.subsampling import Conv2dSubsampling6
 from wenet.transformer.subsampling import Conv2dSubsampling8
 from wenet.transformer.subsampling import LinearNoSubsampling
+from wenet.transformer.subsampling import VGG2L
 from wenet.utils.common import get_activation
 from wenet.utils.mask import make_pad_mask
 from wenet.utils.mask import add_optional_chunk_mask
-
+from wenet.transformer.layer_norm import LayerNorm
+from wenet.utils.common import set_seed
 
 class BaseEncoder(torch.nn.Module):
     def __init__(
@@ -100,6 +102,8 @@ class BaseEncoder(torch.nn.Module):
             subsampling_class = Conv2dSubsampling6
         elif input_layer == "conv2d8":
             subsampling_class = Conv2dSubsampling8
+        elif input_layer == "vgg2l":
+            subsampling_class = VGG2L
         else:
             raise ValueError("unknown input_layer: " + input_layer)
 
@@ -112,7 +116,7 @@ class BaseEncoder(torch.nn.Module):
         )
 
         self.normalize_before = normalize_before
-        self.after_norm = torch.nn.LayerNorm(output_size, eps=1e-12)
+        self.after_norm = LayerNorm(output_size)
         self.static_chunk_size = static_chunk_size
         self.use_dynamic_chunk = use_dynamic_chunk
         self.use_dynamic_left_chunk = use_dynamic_left_chunk
@@ -149,6 +153,9 @@ class BaseEncoder(torch.nn.Module):
         masks = ~make_pad_mask(xs_lens).unsqueeze(1)  # (B, 1, T)
         if self.global_cmvn is not None:
             xs = self.global_cmvn(xs)
+        #set_seed(1)
+        #device = xs.device
+        #xs = torch.rand(xs.shape).to(device)
         xs, pos_emb, masks = self.embed(xs, masks)
         mask_pad = masks  # (B, 1, T/subsample_rate)
         chunk_masks = add_optional_chunk_mask(xs, masks,
@@ -158,7 +165,7 @@ class BaseEncoder(torch.nn.Module):
                                               self.static_chunk_size,
                                               num_decoding_left_chunks)
         for layer in self.encoders:
-            xs, chunk_masks, _ = layer(xs, chunk_masks, pos_emb, mask_pad)
+            xs, pos_emb, chunk_masks  = layer(xs, pos_emb, chunk_masks)
         if self.normalize_before:
             xs = self.after_norm(xs)
         # Here we assume the mask is not changed in encoder layers, so just
@@ -426,13 +433,12 @@ class ConformerEncoder(BaseEncoder):
         positionwise_layer_args = (
             output_size,
             linear_units,
-            dropout_rate,
+            positional_dropout_rate,
             activation,
         )
         # convolution module definition
         convolution_layer = ConvolutionModule
-        convolution_layer_args = (output_size, cnn_module_kernel, activation,
-                                  cnn_module_norm, causal)
+        convolution_layer_args = (output_size, cnn_module_kernel, activation)
 
         self.encoders = torch.nn.ModuleList([
             ConformerEncoderLayer(

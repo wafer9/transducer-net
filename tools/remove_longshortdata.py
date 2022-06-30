@@ -59,3 +59,5 @@ if __name__ == '__main__':
                 if all(condition):
                     fout.write('{}\n'.format(l))
                     continue
+                else:
+                    print (l)

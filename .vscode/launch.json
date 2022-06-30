@@ -1,0 +1,28 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "asr",
+            "type": "python",
+            "request": "launch",
+            "program": "wenet/bin/train.py",
+            "env": {"PYTHONPATH": "/data1/wangzhou/asr/e2e/transducer/transducer-net/examples/aishell/s0"},
+            "console": "integratedTerminal",
+            "cwd": "/data1/wangzhou/asr/e2e/transducer/transducer-net/examples/aishell/s0",
+            "args": 
+               ["--gpu", "7",
+                "--config", "conf/train_conformer.yaml",
+                "--train_data", "raw_wav/train/format.data",
+                "--cv_data", "raw_wav/dev/format.data",
+                "--model_dir", "exp/conformer",
+                "--ddp.init_method", "file://exp/conformer/ddp_init",
+                "--ddp.world_size", "1",
+                "--ddp.rank", "0",
+                "--ddp.dist_backend", "gloo",
+                "--num_workers", "1",
+                "--cmvn", "exp/conformer/global_cmvn",
+                "--pin_memory"
+               ]
+        }
+    ]
+}

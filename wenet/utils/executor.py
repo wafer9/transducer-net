@@ -94,7 +94,7 @@ class Executor:
                     log_str += 'loss_att {:.6f} '.format(loss_att.item())
                 if loss_ctc is not None:
                     log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
-                log_str += 'lr {:.8f} rank {}'.format(lr, rank)
+                log_str += 'lr {:.15f} rank {}'.format(lr, rank)
                 logging.debug(log_str)
 
     def cv(self, model, data_loader, device, args):

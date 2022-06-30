@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 from typeguard import check_argument_types
-
+from wenet.utils.common import set_seed
 
 class CTC(torch.nn.Module):
     """CTC module"""
@@ -21,6 +21,7 @@ class CTC(torch.nn.Module):
         """
         assert check_argument_types()
         super().__init__()
+        set_seed(1)
         eprojs = encoder_output_size
         self.dropout_rate = dropout_rate
         self.ctc_lo = torch.nn.Linear(eprojs, odim)

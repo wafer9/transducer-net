@@ -16,6 +16,7 @@ from __future__ import print_function
 
 import argparse
 import copy
+import imp
 import logging
 import os
 
@@ -31,8 +32,7 @@ from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import load_checkpoint, save_checkpoint
 from wenet.utils.executor import Executor
 from wenet.utils.scheduler import WarmupLR
-from wenet.utils.common import read_symbol_table
-
+from wenet.utils.common import set_seed
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='training your network')
     parser.add_argument('--config', required=True, help='config file')
@@ -80,22 +80,20 @@ if __name__ == '__main__':
                         default=False,
                         help='Use automatic mixed precision training')
     parser.add_argument('--cmvn', default=None, help='global cmvn file')
-    parser.add_argument('--symbol_table',
-                        required=True,
-                        help='model unit symbol table for training')
+
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
     # Set random seed
-    torch.manual_seed(777)
+    #torch.manual_seed(1)
+    set_seed(1)
     print(args)
     with open(args.config, 'r') as fin:
         configs = yaml.load(fin, Loader=yaml.FullLoader)
 
     distributed = args.world_size > 1
-    symbol_table = read_symbol_table(args.symbol_table)
 
     raw_wav = configs['raw_wav']
 
@@ -131,11 +129,11 @@ if __name__ == '__main__':
     else:
         train_sampler = None
         cv_sampler = None
-
+    set_seed(1)
     train_data_loader = DataLoader(train_dataset,
                                    collate_fn=train_collate_func,
                                    sampler=train_sampler,
-                                   shuffle=(train_sampler is None),
+                                   shuffle=False,
                                    pin_memory=args.pin_memory,
                                    batch_size=1,
                                    num_workers=args.num_workers)
@@ -167,16 +165,16 @@ if __name__ == '__main__':
 
     # Init asr model from configs
     model = init_asr_model(configs)
-    print(model)
-    num_params = sum(p.numel() for p in model.parameters())
-    print('the number of model params: {}'.format(num_params))
 
     # !!!IMPORTANT!!!
     # Try to export the model by script, if fails, we should refine
     # the code to satisfy the script export requirements
     if args.rank == 0:
-        script_model = torch.jit.script(model)
-        script_model.save(os.path.join(args.model_dir, 'init.zip'))
+        print(model)
+        num_params = sum(p.numel() for p in model.parameters())
+        print('the number of model params: {}'.format(num_params))
+        #script_model = torch.jit.script(model)
+        #script_model.save(os.path.join(args.model_dir, 'init.zip'))
     executor = Executor()
     # If specify checkpoint, load some info from checkpoint
     if args.checkpoint is not None:

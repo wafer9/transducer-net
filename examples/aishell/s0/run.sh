@@ -2,6 +2,7 @@
 
 # Copyright 2019 Mobvoi Inc. All Rights Reserved.
 . ./path.sh || exit 1;
+. ./cmd.sh || exit 1;
 
 # Use this to control how many gpu you use, It's 1-gpu training if you specify
 # just 1gpu, otherwise it's is multiple gpu training based on DDP in pytorch
@@ -11,8 +12,8 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
 # export NCCL_SOCKET_IFNAME=ens4f1
 export NCCL_DEBUG=INFO
-stage=2 # start from 0 if you need to start from data preparation
-stop_stage=3
+stage=0 # start from 0 if you need to start from data preparation
+stop_stage=4
 # The num of nodes or machines used for multi-machine training
 # Default 1 for single machine/node
 # NFS will be needed if you want run multi-machine training
@@ -71,15 +72,50 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
             > data/${x}/text
         rm data/${x}/text.org
     done
-
-
-    tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
-        --in_scp data/${train_set}/wav.scp \
-        --out_cmvn data/${train_set}/global_cmvn
+    # For wav feature, just copy the data. Fbank extraction is done in training
+    mkdir -p $feat_dir
+    for x in ${train_set} dev test; do
+        cp -r data/$x $feat_dir
+    done
 
 fi
 
+train_set=train_sp
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
+    ### Task dependent. You have to design training and dev sets by yourself.
+    ### But you can utilize Kaldi recipes in most cases
+    echo "stage 1: Feature Generation"
+    fbankdir=fbank
+    # Generate the fbank features; by default 80-dimensional fbanks with pitch on each frame
+    steps/make_fbank.sh --cmd "$train_cmd" --nj 64 --compress false --write_utt2num_frames true \
+        data/train exp/make_fbank/train ${fbankdir}
+    utils/fix_data_dir.sh data/train
+    steps/make_fbank.sh --cmd "$train_cmd" --nj 40 --compress false --write_utt2num_frames true \
+        data/dev exp/make_fbank/dev ${fbankdir}
+    utils/fix_data_dir.sh data/dev
+    steps/make_fbank.sh --cmd "$train_cmd" --nj 40 --compress false  --write_utt2num_frames true \
+        data/test exp/make_fbank/test ${fbankdir}
+    utils/fix_data_dir.sh data/test
+
+    # speed-perturbed
+    utils/perturb_data_dir_speed.sh 0.9 data/train data/temp1
+    utils/perturb_data_dir_speed.sh 1.0 data/train data/temp2
+    utils/perturb_data_dir_speed.sh 1.1 data/train data/temp3
+    utils/combine_data.sh --extra-files utt2uniq data/${train_set} data/temp1 data/temp2 data/temp3
+    rm -r data/temp1 data/temp2 data/temp3
+    steps/make_fbank.sh --cmd "$train_cmd" --nj 64 --compress false --write_utt2num_frames true \
+        data/${train_set} exp/make_fbank/${train_set} ${fbankdir}
+    utils/fix_data_dir.sh data/${train_set}
+
+    compute-cmvn-stats --binary=false scp:data/${train_set}/feats.scp data/${train_set}/cmvn.ark
+    cp data/${train_set}/cmvn.ark data/${train_set}/global_cmvn
+    #tools/compute_cmvn_stats.py --num_workers 16 --train_config $train_config \
+    #--in_scp data/${train_set}/wav.scp \
+    #--out_cmvn data/${train_set}/global_cmvn
+    
+fi
+
+if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
     # Make train dict
     echo "Make a dictionary"
     mkdir -p $(dirname $dict)
@@ -91,17 +127,20 @@ if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
     echo "<sos/eos> $num_token" >> $dict # <eos>
 fi
 
-if [ ${stage} -le 3 ] && [ ${stop_stage} -ge 3 ]; then
+if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
     nj=32
     # Prepare wenet requried data
     echo "Prepare data, prepare requried format"
     for x in dev test ${train_set}; do
-      tools/make_raw_list.py data/$x/wav.scp data/$x/text \
-        data/$x/data.list
+        tools/format_data.sh --nj ${nj} \
+            --feat-type kaldi --feat data/$x/feats.scp \
+            $feat_dir/$x ${dict} > $feat_dir/$x/format.data.tmp
+        cp $feat_dir/$x/format.data.tmp $feat_dir/$x/format.data
     done
 fi
 
-if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
+
+if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     # Training
     mkdir -p $dir
     INIT_FILE=$dir/ddp_init
@@ -133,9 +172,8 @@ if [ ${stage} -le 4 ] && [ ${stop_stage} -ge 4 ]; then
         rank=`expr $node_rank \* $num_gpus + $i`
         python wenet/bin/train.py --gpu $gpu_id \
             --config $train_config \
-            --symbol_table $dict \
-            --train_data data/$train_set/data.list \
-            --cv_data data/dev/data.list \
+            --train_data $feat_dir/$train_set/format.data \
+            --cv_data $feat_dir/dev/format.data \
             ${checkpoint:+--checkpoint $checkpoint} \
             --model_dir $dir \
             --ddp.init_method $init_method \

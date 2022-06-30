@@ -8,7 +8,7 @@
 from typing import Tuple
 
 import torch
-
+from wenet.utils.common import set_seed
 
 class BaseSubsampling(torch.nn.Module):
     def __init__(self):
@@ -226,3 +226,83 @@ class Conv2dSubsampling8(BaseSubsampling):
         x = self.linear(x.transpose(1, 2).contiguous().view(b, t, c * f))
         x, pos_emb = self.pos_enc(x, offset)
         return x, pos_emb, x_mask[:, :, :-2:2][:, :, :-2:2][:, :, :-2:2]
+
+class VGG2L(BaseSubsampling):
+    """VGG-like module
+    Args:
+        idim (int): Input dimension.
+        odim (int): Output dimension.
+        dropout_rate (float): Dropout rate.
+    """
+
+    def __init__(self, idim: int, odim: int, dropout_rate: float,
+                 pos_enc_class: torch.nn.Module):
+        super().__init__()
+        set_seed(1)
+        self.vgg2l = torch.nn.Sequential(
+            torch.nn.Conv2d(1, 64, 3, stride=1, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(64, 64, 3, stride=1, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.MaxPool2d((3, 2)),
+            torch.nn.Conv2d(64, 128, 3, stride=1, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.Conv2d(128, 128, 3, stride=1, padding=1),
+            torch.nn.ReLU(),
+            torch.nn.MaxPool2d((2, 2)),
+        )
+        #self.output = torch.nn.Linear(128 * ((idim // 2) // 2), odim)
+        #self.pos_enc = pos_enc_class
+        if pos_enc_class is not None:
+            self.output = torch.nn.Sequential(
+                torch.nn.Linear(128 * ((idim // 2) // 2), odim), pos_enc_class
+            )
+        else:
+            self.output = torch.nn.Linear(128 * ((idim // 2) // 2), odim)
+
+    def forward(self, 
+            x: torch.Tensor,
+            x_mask: torch.Tensor,
+            offset: int = 0
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """VGG2L forward
+        Args:
+            x (torch.Tensor): Input tensor (#batch, time, idim).
+            x_mask (torch.Tensor): Input mask (#batch, 1, time).
+
+        Returns:
+            torch.Tensor: Subsampled tensor (#batch, time', odim),
+                where time' = time // 4.
+            torch.Tensor: Subsampled mask (#batch, 1, time'),
+                where time' = time // 4.
+            torch.Tensor: positional encoding
+
+        """
+
+        x = x.unsqueeze(1)  # (b, c, t, f)
+        vgg_output = self.vgg2l(x)
+        b, c, t, f = vgg_output.size()
+        vgg_output = self.output(vgg_output.transpose(1, 2).contiguous().view(b, t, c * f))
+        #x, pos_emb = self.pos_enc(x, offset)
+
+        x_mask = self.create_new_mask(x_mask)
+
+        return vgg_output[0], vgg_output[1], x_mask
+
+    def create_new_mask(self, feats_mask: torch.Tensor) -> torch.Tensor:
+        """Create a subsampled mask of feature sequences.
+
+        Args:
+            feats_mask: Mask of feature sequences. (B, 1, F)
+
+        Returns:
+            vgg_mask: Mask of VGG2L output sequences. (B, 1, sub(F))
+
+        """
+        vgg1_t_len = feats_mask.size(2) - (feats_mask.size(2) % 3)
+        vgg_mask = feats_mask[:, :, :vgg1_t_len][:, :, ::3]
+
+        vgg2_t_len = vgg_mask.size(2) - (vgg_mask.size(2) % 2)
+        vgg_mask = vgg_mask[:, :, :vgg2_t_len][:, :, ::2]
+
+        return vgg_mask
