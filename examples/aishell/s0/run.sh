@@ -12,8 +12,8 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html
 # export NCCL_SOCKET_IFNAME=ens4f1
 export NCCL_DEBUG=INFO
-stage=0 # start from 0 if you need to start from data preparation
-stop_stage=4
+stage=5 # start from 0 if you need to start from data preparation
+stop_stage=5
 # The num of nodes or machines used for multi-machine training
 # Default 1 for single machine/node
 # NFS will be needed if you want run multi-machine training
@@ -23,7 +23,7 @@ num_nodes=1
 # the third one set node_rank 2, and so on. Default 0
 node_rank=0
 # data
-data=/data1/wangzhou/data/aishell_set
+data=/data/joe/audio/aishell_set/
 data_url=www.openslr.org/resources/33
 
 nj=16
@@ -39,9 +39,9 @@ train_set=train
 # 5. conf/train_conformer_no_pos.yaml: Conformer without relative positional encoding
 # 6. conf/train_u2++_conformer.yaml: U2++ conformer
 # 7. conf/train_u2++_transformer.yaml: U2++ transformer
-train_config=conf/train_conformer.yaml
+train_config=conf/train_conformer4.yaml
 cmvn=true
-dir=exp/conformer
+dir=exp/conformer4
 checkpoint=
 
 # use average_checkpoint will get better result
@@ -63,7 +63,7 @@ if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     local/aishell_data_prep.sh ${data}/data_aishell/wav ${data}/data_aishell/transcript
 fi
 
-
+train_set=train_sp
 if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
     # remove the space between the text labels for Mandarin dataset
     for x in train dev test; do
@@ -80,7 +80,6 @@ if [ ${stage} -le 1 ] && [ ${stop_stage} -ge 1 ]; then
 
 fi
 
-train_set=train_sp
 if [ ${stage} -le 2 ] && [ ${stop_stage} -ge 2 ]; then
     ### Task dependent. You have to design training and dev sets by yourself.
     ### But you can utilize Kaldi recipes in most cases
@@ -151,7 +150,7 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     # The number of gpus runing on each node/machine
     num_gpus=$(echo $CUDA_VISIBLE_DEVICES | awk -F "," '{print NF}')
     # Use "nccl" if it works, otherwise use "gloo"
-    dist_backend="nccl"
+    dist_backend="gloo"
     # The total number of processes/gpus, so that the master knows
     # how many workers to wait for.
     # More details about ddp can be found in
@@ -180,7 +179,7 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
             --ddp.world_size $world_size \
             --ddp.rank $rank \
             --ddp.dist_backend $dist_backend \
-            --num_workers 2 \
+            --num_workers 16 \
             $cmvn_opts \
             --pin_memory
     } &
@@ -188,7 +187,7 @@ if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
     wait
 fi
 
-if [ ${stage} -le 5 ] && [ ${stop_stage} -ge 5 ]; then
+if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
     # Test model, please specify the model you want to test by --checkpoint
     if [ ${average_checkpoint} == true ]; then
         decode_checkpoint=$dir/avg_${average_num}.pt

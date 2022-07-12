@@ -54,7 +54,7 @@ class Executor:
                 # The more details about amp can be found in
                 # https://pytorch.org/docs/stable/notes/amp_examples.html
                 with torch.cuda.amp.autocast(scaler is not None):
-                    loss, loss_att, loss_ctc = model(feats, feats_lengths,
+                    loss, loss_att, loss_ctc, loss_trans = model(feats, feats_lengths,
                                                      target, target_lengths)
                     loss = loss / accum_grad
                 if use_amp:
@@ -94,6 +94,8 @@ class Executor:
                     log_str += 'loss_att {:.6f} '.format(loss_att.item())
                 if loss_ctc is not None:
                     log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
+                if loss_trans is not None:
+                    log_str += 'loss_trans {:.6f} '.format(loss_trans.item())
                 log_str += 'lr {:.15f} rank {}'.format(lr, rank)
                 logging.debug(log_str)
 
@@ -116,7 +118,7 @@ class Executor:
                 num_utts = target_lengths.size(0)
                 if num_utts == 0:
                     continue
-                loss, loss_att, loss_ctc = model(feats, feats_lengths, target,
+                loss, loss_att, loss_ctc, loss_trans= model(feats, feats_lengths, target,
                                                  target_lengths)
                 if torch.isfinite(loss):
                     num_seen_utts += num_utts
@@ -128,6 +130,8 @@ class Executor:
                         log_str += 'loss_att {:.6f} '.format(loss_att.item())
                     if loss_ctc is not None:
                         log_str += 'loss_ctc {:.6f} '.format(loss_ctc.item())
+                    if loss_trans is not None:
+                        log_str += 'loss_trans {:.6f} '.format(loss_trans.item())
                     log_str += 'history loss {:.6f}'.format(total_loss /
                                                             num_seen_utts)
                     logging.debug(log_str)

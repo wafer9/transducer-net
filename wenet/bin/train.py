@@ -16,7 +16,6 @@ from __future__ import print_function
 
 import argparse
 import copy
-import imp
 import logging
 import os
 
@@ -133,7 +132,7 @@ if __name__ == '__main__':
     train_data_loader = DataLoader(train_dataset,
                                    collate_fn=train_collate_func,
                                    sampler=train_sampler,
-                                   shuffle=False,
+                                   shuffle=(train_sampler is None),
                                    pin_memory=args.pin_memory,
                                    batch_size=1,
                                    num_workers=args.num_workers)

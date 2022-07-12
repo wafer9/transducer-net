@@ -284,8 +284,8 @@ def _load_feature(batch):
     lengths = []
     for i, x in enumerate(batch):
         try:
-            #mat = kaldi_io.read_mat(x[1])
-            mat = kaldiio.load_mat(x[1])
+            mat = kaldi_io.read_mat(x[1])
+            #mat = kaldiio.load_mat(x[1])
             feats.append(mat)
             keys.append(x[0])
             lengths.append(mat.shape[0])
@@ -455,8 +455,8 @@ class AudioDataset(Dataset):
                     self.input_dim = feat_dim
                 self.output_dim = output_dim
         if sort:
-            data = sorted(data, key=lambda x: x[0])
-            data = sorted(data, key=lambda x: x[2], reverse=True)
+            #data = sorted(data, key=lambda x: x[0])
+            data = sorted(data, key=lambda x: x[2])
         valid_data = []
         for i in range(len(data)):
             length = data[i][2]

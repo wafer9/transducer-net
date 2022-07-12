@@ -54,6 +54,7 @@ if __name__ == '__main__':
     parser.add_argument('--mode',
                         choices=[
                             'attention', 'ctc_greedy_search',
+                            'trans_greedy_search', 'default_beam_search',
                             'ctc_prefix_beam_search', 'attention_rescoring'
                         ],
                         default='attention',
@@ -163,9 +164,29 @@ if __name__ == '__main__':
                     decoding_chunk_size=args.decoding_chunk_size,
                     num_decoding_left_chunks=args.num_decoding_left_chunks,
                     simulate_streaming=args.simulate_streaming)
+            elif args.mode == 'trans_greedy_search':
+                hyps = model.trans_greedy_search(
+                    feats,
+                    feats_lengths,
+                    decoding_chunk_size=args.decoding_chunk_size,
+                    num_decoding_left_chunks=args.num_decoding_left_chunks,
+                    simulate_streaming=args.simulate_streaming)
+                hyps = [hyps[1:]]
             # ctc_prefix_beam_search and attention_rescoring only return one
             # result in List[int], change it to List[List[int]] for compatible
             # with other batch decoding mode
+            elif args.mode == 'default_beam_search':
+                hyps = model.default_beam_search(
+                    feats,
+                    feats_lengths,
+                    decoding_chunk_size=args.decoding_chunk_size,
+                    num_decoding_left_chunks=args.num_decoding_left_chunks,
+                    simulate_streaming=args.simulate_streaming)
+                hyps = [hyps[1:]]
+            # ctc_prefix_beam_search and attention_rescoring only return one
+            # result in List[int], change it to List[List[int]] for compatible
+            # with other batch decoding mode
+            
             elif args.mode == 'ctc_prefix_beam_search':
                 assert (feats.size(0) == 1)
                 hyp = model.ctc_prefix_beam_search(
