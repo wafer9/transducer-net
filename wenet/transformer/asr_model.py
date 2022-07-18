@@ -13,10 +13,10 @@
 # limitations under the License.
 
 from collections import defaultdict
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union, Dict
 
 import torch
-
+import k2
 from torch.nn.utils.rnn import pad_sequence
 
 from wenet.transformer.cmvn import GlobalCMVN
@@ -37,6 +37,8 @@ from wenet.utils.mask import (make_pad_mask, mask_finished_preds,
 from warprnnt_pytorch import RNNTLoss
 from wenet.utils.common import Hypothesis
 from wenet.utils.common import initializer
+from wenet.utils.lattice import get_texts
+from wenet.utils.lattice import Nbest
 
 class ASRModel(torch.nn.Module):
     """CTC-attention hybrid Encoder-Decoder model"""
@@ -206,6 +208,31 @@ class ASRModel(torch.nn.Module):
             )  # (B, maxlen, encoder_dim)
         return encoder_out, encoder_mask
 
+    def prior(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        decoding_chunk_size: int = -1,
+        num_decoding_left_chunks: int = -1,
+        simulate_streaming: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert speech.shape[0] == speech_lengths.shape[0]
+        assert decoding_chunk_size != 0
+        batch_size = speech.shape[0]
+        # For CTC prefix beam search, we only support batch_size=1
+        # Let's assume B = batch_size and N = beam_size
+        # 1. Encoder forward and get CTC score
+        encoder_out, encoder_mask = self._forward_encoder(
+            speech, speech_lengths, decoding_chunk_size,
+            num_decoding_left_chunks,
+            simulate_streaming)  # (B, maxlen, encoder_dim)
+        maxlen = encoder_out.size(1)
+        encoder_out_lens = encoder_mask.squeeze(1).sum(1)
+        ctc_probs = self.ctc.log_softmax(
+            encoder_out)  # (B, maxlen, vocab_size)
+
+        return ctc_probs.exp(), encoder_out_lens
+
     def ctc_greedy_search(
         self,
         speech: torch.Tensor,
@@ -334,6 +361,234 @@ class ASRModel(torch.nn.Module):
             cur_hyps = next_hyps[:beam_size]
         hyps = [(y[0], log_add([y[1][0], y[1][1]])) for y in cur_hyps]
         return hyps, encoder_out
+
+    def ctc_fst_beam_search(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        beam_size: int,
+        HLG: Optional[k2.Fsa],
+        prior: torch.Tensor,
+        decoding_chunk_size: int = -1,
+        num_decoding_left_chunks: int = -1,
+        simulate_streaming: bool = False,
+    ) -> Tuple[List[List[int]], torch.Tensor]:
+        """ CTC prefix beam search inner implementation
+
+        Args:
+            speech (torch.Tensor): (batch, max_len, feat_dim)
+            speech_length (torch.Tensor): (batch, )
+            beam_size (int): beam size for beam search
+            decoding_chunk_size (int): decoding chunk for dynamic chunk
+                trained model.
+                <0: for decoding, use full chunk.
+                >0: for decoding, use fixed chunk size as set.
+                0: used for training, it's prohibited here
+            simulate_streaming (bool): whether do encoder forward in a
+                streaming fashion
+
+        Returns:
+            List[List[int]]: nbest results
+            torch.Tensor: encoder output, (1, max_len, encoder_dim),
+                it will be used for rescoring in attention rescoring mode
+        """
+        assert speech.shape[0] == speech_lengths.shape[0]
+        assert decoding_chunk_size != 0
+        batch_size = speech.shape[0]
+        # For CTC prefix beam search, we only support batch_size=1
+        assert batch_size == 1
+        # Let's assume B = batch_size and N = beam_size
+        # 1. Encoder forward and get CTC score
+        encoder_out, encoder_mask = self._forward_encoder(
+            speech, speech_lengths, decoding_chunk_size,
+            num_decoding_left_chunks,
+            simulate_streaming)  # (B, maxlen, encoder_dim)
+        maxlen = encoder_out.size(1)
+        encoder_out_lens = encoder_mask.squeeze(1).sum(1)
+        ctc_probs = self.ctc.log_softmax(
+            encoder_out)  # (B, maxlen, vocab_size)
+        ctc_probs = ctc_probs - prior
+
+        subsampling_factor = 6
+        min_active_states = 30
+        max_active_states = 7000
+        supervision_segments = torch.stack(
+            (
+                torch.tensor([0]),
+                torch.tensor([0]),
+                torch.tensor([speech_lengths[0].item() // subsampling_factor])
+            ),
+            1,
+        ).to(torch.int32)
+        supervision_segments = supervision_segments.to('cpu')
+        dense_fsa_vec = k2.DenseFsaVec(
+            ctc_probs,
+            supervision_segments,
+            allow_truncate=subsampling_factor - 1,
+        )
+
+        lattice = k2.intersect_dense_pruned(
+            HLG,
+            dense_fsa_vec,
+            search_beam=beam_size,
+            output_beam=beam_size,
+            min_active_states=min_active_states,
+            max_active_states=max_active_states,
+        )
+        best_path = k2.shortest_path(lattice, use_double_scores=True)
+        hyps = get_texts(best_path)
+        return hyps
+    
+
+    def ctc_fst_attention_rescore(
+        self,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        beam_size: int,
+        HLG: Optional[k2.Fsa],
+        prior: torch.Tensor,
+        decoding_chunk_size: int = -1,
+        num_decoding_left_chunks: int = -1,
+        simulate_streaming: bool = False,
+    ) -> Dict:
+        """ CTC prefix beam search inner implementation
+
+        Args:
+            speech (torch.Tensor): (batch, max_len, feat_dim)
+            speech_length (torch.Tensor): (batch, )
+            beam_size (int): beam size for beam search
+            decoding_chunk_size (int): decoding chunk for dynamic chunk
+                trained model.
+                <0: for decoding, use full chunk.
+                >0: for decoding, use fixed chunk size as set.
+                0: used for training, it's prohibited here
+            simulate_streaming (bool): whether do encoder forward in a
+                streaming fashion
+
+        Returns:
+            List[List[int]]: nbest results
+            torch.Tensor: encoder output, (1, max_len, encoder_dim),
+                it will be used for rescoring in attention rescoring mode
+        """
+        assert speech.shape[0] == speech_lengths.shape[0]
+        assert decoding_chunk_size != 0
+        batch_size = speech.shape[0]
+        device = speech.device
+        # For CTC prefix beam search, we only support batch_size=1
+        assert batch_size == 1
+        # Let's assume B = batch_size and N = beam_size
+        # 1. Encoder forward and get CTC score
+        encoder_out, encoder_mask = self._forward_encoder(
+            speech, speech_lengths, decoding_chunk_size,
+            num_decoding_left_chunks,
+            simulate_streaming)  # (B, maxlen, encoder_dim)
+        maxlen = encoder_out.size(1)
+        encoder_out_lens = encoder_mask.squeeze(1).sum(1)
+        ctc_probs = self.ctc.log_softmax(
+            encoder_out)  # (B, maxlen, vocab_size)
+        ctc_probs = ctc_probs - prior
+
+        subsampling_factor = 6
+        min_active_states = 30
+        max_active_states = 7000
+        supervision_segments = torch.stack(
+            (
+                torch.tensor([0]),
+                torch.tensor([0]),
+                torch.tensor([speech_lengths[0].item() // subsampling_factor])
+            ),
+            1,
+        ).to(torch.int32)
+        supervision_segments = supervision_segments.to('cpu')
+        dense_fsa_vec = k2.DenseFsaVec(
+            ctc_probs,
+            supervision_segments,
+            allow_truncate=subsampling_factor - 1,
+        )
+
+        lattice = k2.intersect_dense_pruned(
+            HLG,
+            dense_fsa_vec,
+            search_beam=beam_size,
+            output_beam=beam_size,
+            min_active_states=min_active_states,
+            max_active_states=max_active_states,
+        )
+
+        nbest = Nbest.from_lattice(
+            lattice=lattice,
+            num_paths=50,
+            use_double_scores=True,
+            nbest_scale=0.5,
+        )
+        nbest = nbest.intersect(lattice)
+        am_scores = nbest.compute_am_scores()
+        ngram_lm_scores = nbest.compute_lm_scores()
+        assert hasattr(nbest.fsa, "tokens")
+        assert isinstance(nbest.fsa.tokens, torch.Tensor)
+
+        # remove axis corresponding to states.
+        tokens_shape = nbest.fsa.arcs.shape().remove_axis(1)
+        tokens = k2.RaggedTensor(tokens_shape, nbest.fsa.tokens)
+        tokens = tokens.remove_values_leq(0)
+        token_ids = tokens.tolist()
+        beam_size = len(token_ids)
+
+
+        hyps_pad = pad_sequence([
+            torch.tensor(token_id, device=device, dtype=torch.long)
+            for token_id in token_ids
+        ], True, self.ignore_id)
+
+        hyps_lens = torch.tensor([len(token_id) for token_id in token_ids],
+                                 device=device,
+                                 dtype=torch.long)  # (beam_size,)
+        hyps_pad, _ = add_sos_eos(hyps_pad, self.sos, self.eos, self.ignore_id)
+        hyps_lens = hyps_lens + 1  # Add <sos> at begining
+        encoder_out = encoder_out.repeat(beam_size, 1, 1)
+        encoder_mask = torch.ones(beam_size,
+                                  1,
+                                  encoder_out.size(1),
+                                  dtype=torch.bool,
+                                  device=device)
+        decoder_out, _, _ = self.decoder(
+            encoder_out, encoder_mask, hyps_pad, hyps_lens)  # (beam_size, max_hyps_len, vocab_size)
+        decoder_out = torch.nn.functional.log_softmax(decoder_out, dim=-1)
+        decoder_out = decoder_out.cpu().numpy()
+
+        ngram_lm_scale_list = [0.01, 0.05, 0.08]
+        ngram_lm_scale_list += [0.1, 0.3, 0.5, 0.6, 0.7, 0.9, 1.0]
+        ngram_lm_scale_list += [1.1, 1.2, 1.3, 1.5, 1.7, 1.9, 2.0]
+        ngram_lm_scale_list += [2.1, 2.2, 2.3, 2.5, 3.0, 4.0, 5.0]
+
+        attention_scale_list = [0.01, 0.05, 0.08]
+        attention_scale_list += [0.1, 0.3, 0.5, 0.6, 0.7, 0.9, 1.0]
+        attention_scale_list += [1.1, 1.2, 1.3, 1.5, 1.7, 1.9, 2.0]
+        attention_scale_list += [2.1, 2.2, 2.3, 2.5, 3.0, 4.0, 5.0]
+
+        attention_scores = torch.zeros(beam_size).to(device)
+        for i, token_id in enumerate(token_ids):
+                for j, w in enumerate(token_id):
+                    attention_scores[i] += decoder_out[i][j][w]
+                attention_scores[i] += decoder_out[i][len(token_id)][self.eos]
+
+        ans = dict()
+        for n_scale in ngram_lm_scale_list:
+            for a_scale in attention_scale_list:
+                tot_scores = (
+                    am_scores.values
+                    + n_scale * ngram_lm_scores.values
+                    + a_scale * attention_scores
+                )
+                ragged_tot_scores = k2.RaggedTensor(nbest.shape, tot_scores)
+                max_indexes = ragged_tot_scores.argmax()
+                best_path = k2.index_fsa(nbest.fsa, max_indexes)
+
+                key = f"ngram_lm_scale_{n_scale}_attention_scale_{a_scale}"
+                ans[key] = get_texts(best_path)[0]
+
+        return ans
+    
 
     def ctc_prefix_beam_search(
         self,

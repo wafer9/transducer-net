@@ -19,6 +19,7 @@ import copy
 import logging
 import os
 import sys
+import k2
 
 import torch
 import yaml
@@ -27,10 +28,15 @@ from torch.utils.data import DataLoader
 from wenet.dataset.dataset import AudioDataset, CollateFunc
 from wenet.transformer.asr_model import init_asr_model
 from wenet.utils.checkpoint import load_checkpoint
+from wenet.utils.lexicon import Lexicon
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='recognize with your model')
     parser.add_argument('--config', required=True, help='config file')
+    parser.add_argument("--lang-dir", type=str, default="data/lang_char", help="The lang dir",)
+    parser.add_argument("--lm-dir", type=str, default="data/lm",
+        help="""The LM dir.  It should contain either G_3_gram.pt or G_3_gram.fst.txt """,
+    )
     parser.add_argument('--test_data', required=True, help='test data file')
     parser.add_argument('--gpu',
                         type=int,
@@ -47,6 +53,7 @@ if __name__ == '__main__':
                         default=0.0,
                         help='length penalty')
     parser.add_argument('--result_file', required=True, help='asr result file')
+    parser.add_argument('--prior_file', required=True, help='asr result file')
     parser.add_argument('--batch_size',
                         type=int,
                         default=16,
@@ -54,6 +61,7 @@ if __name__ == '__main__':
     parser.add_argument('--mode',
                         choices=[
                             'attention', 'ctc_greedy_search',
+                            'ctc_fst_beam_search', 'ctc_fst_attention_rescore',
                             'trans_greedy_search', 'default_beam_search',
                             'ctc_prefix_beam_search', 'attention_rescoring'
                         ],
@@ -84,6 +92,20 @@ if __name__ == '__main__':
                                 decode mode''')
     args = parser.parse_args()
     print(args)
+    ########### load hlg.fst ##############
+    lexicon = Lexicon(args.lang_dir)
+    max_token_id = max(lexicon.tokens)
+    num_classes = max_token_id + 1  # +1 for the blank
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda", 0)
+    HLG = k2.Fsa.from_dict(
+        torch.load(f"{args.lang_dir}/HLG.pt", map_location=device)
+    )
+    assert HLG.requires_grad is False
+    if not hasattr(HLG, "lm_scores"):
+        HLG.lm_scores = HLG.scores.clone()
+    ############### k2 #################
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s')
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
@@ -135,6 +157,19 @@ if __name__ == '__main__':
             char_dict[int(arr[1])] = arr[0]
     eos = len(char_dict) - 1
 
+    word_dict = {}
+    with open(args.lang_dir + '/words.txt', 'r') as fin:
+        for line in fin:
+            arr = line.strip().split()
+            assert len(arr) == 2
+            word_dict[int(arr[1])] = arr[0]
+
+    with open(args.prior_file, 'r') as fin:
+        line = fin.readlines()
+        assert len(line) == 1
+        prior = [float(x) for x in line[0].strip().split()]
+    prior = torch.tensor(prior).to(device).log()
+
     load_checkpoint(model, args.checkpoint)
     use_cuda = args.gpu >= 0 and torch.cuda.is_available()
     device = torch.device('cuda' if use_cuda else 'cpu')
@@ -164,6 +199,27 @@ if __name__ == '__main__':
                     decoding_chunk_size=args.decoding_chunk_size,
                     num_decoding_left_chunks=args.num_decoding_left_chunks,
                     simulate_streaming=args.simulate_streaming)
+            elif args.mode == 'ctc_fst_beam_search':
+                hyps = model.ctc_fst_beam_search(
+                    feats,
+                    feats_lengths,
+                    args.beam_size,
+                    HLG,
+                    prior,
+                    decoding_chunk_size=args.decoding_chunk_size,
+                    num_decoding_left_chunks=args.num_decoding_left_chunks,
+                    simulate_streaming=args.simulate_streaming)
+            elif args.mode == 'ctc_fst_attention_rescore':
+                hyps = model.ctc_fst_attention_rescore(
+                    feats,
+                    feats_lengths,
+                    args.beam_size,
+                    HLG,
+                    prior,
+                    decoding_chunk_size=args.decoding_chunk_size,
+                    num_decoding_left_chunks=args.num_decoding_left_chunks,
+                    simulate_streaming=args.simulate_streaming)
+                
             elif args.mode == 'trans_greedy_search':
                 hyps = model.trans_greedy_search(
                     feats,
@@ -209,11 +265,23 @@ if __name__ == '__main__':
                     simulate_streaming=args.simulate_streaming,
                     reverse_weight=args.reverse_weight)
                 hyps = [hyp]
-            for i, key in enumerate(keys):
-                content = ''
-                for w in hyps[i]:
-                    if w == eos:
-                        break
-                    content += char_dict[w]
-                logging.info('{} {}'.format(key, content))
-                fout.write('{} {}\n'.format(key, content))
+
+            if args.mode == 'ctc_fst_attention_rescore':
+                for i, key in enumerate(keys):
+                    for k, v in hyps.items():
+                        content = ''
+                        for w in v:
+                            content += word_dict[w]
+                        fout.write('{} {} {}\n'.format(key, k, content))
+            else:
+                for i, key in enumerate(keys):
+                    content = ''
+                    for w in hyps[i]:
+                        if args.mode == 'ctc_fst_beam_search':
+                            content += word_dict[w]
+                        else:
+                            if w == eos:
+                                break
+                            content += char_dict[w]
+                    logging.info('{} {}'.format(key, content))
+                    fout.write('{} {}\n'.format(key, content))

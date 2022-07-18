@@ -61,6 +61,7 @@ fi
 if [ ${stage} -le 0 ] && [ ${stop_stage} -ge 0 ]; then
     # Data preparation
     local/aishell_data_prep.sh ${data}/data_aishell/wav ${data}/data_aishell/transcript
+    local/prepare.sh ${data}
 fi
 
 train_set=train_sp
@@ -198,6 +199,12 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
             --num ${average_num} \
             --val_best
     fi
+    python wenet/bin/prior.py --gpu 0 \
+            --config $dir/train.yaml \
+            --train_data $feat_dir/train/format.data \
+            --checkpoint $decode_checkpoint \
+            --prior_file $test_dir/prior.txt 
+
     # Specify decoding_chunk_size if it's a unified dynamic chunk trained model
     # -1 for full chunk
     decoding_chunk_size=
@@ -218,6 +225,7 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
             --dict $dict \
             --ctc_weight $ctc_weight \
             --reverse_weight $reverse_weight \
+            --prior_file $test_dir/prior.txt \
             --result_file $test_dir/text \
             ${decoding_chunk_size:+--decoding_chunk_size $decoding_chunk_size}
          python tools/compute-wer.py --char=1 --v=1 \
@@ -225,63 +233,4 @@ if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
     } &
     done
     wait
-
 fi
-
-if [ ${stage} -le 6 ] && [ ${stop_stage} -ge 6 ]; then
-    # Export the best model you want
-    python wenet/bin/export_jit.py \
-        --config $dir/train.yaml \
-        --checkpoint $dir/avg_${average_num}.pt \
-        --output_file $dir/final.zip \
-        --output_quant_file $dir/final_quant.zip
-fi
-
-# Optionally, you can add LM and test it with runtime.
-if [ ${stage} -le 7 ] && [ ${stop_stage} -ge 7 ]; then
-    # 7.1 Prepare dict
-    unit_file=$dict
-    mkdir -p data/local/dict
-    cp $unit_file data/local/dict/units.txt
-    tools/fst/prepare_dict.py $unit_file ${data}/resource_aishell/lexicon.txt \
-        data/local/dict/lexicon.txt
-    # 7.2 Train lm
-    lm=data/local/lm
-    mkdir -p $lm
-    tools/filter_scp.pl data/train/text \
-         $data/data_aishell/transcript/aishell_transcript_v0.8.txt > $lm/text
-    local/aishell_train_lms.sh
-    # 7.3 Build decoding TLG
-    tools/fst/compile_lexicon_token_fst.sh \
-        data/local/dict data/local/tmp data/local/lang
-    tools/fst/make_tlg.sh data/local/lm data/local/lang data/lang_test || exit 1;
-    # 7.4 Decoding with runtime
-    # reverse_weight only works for u2++ model and only left to right decoder is used when it is set to 0.0.
-    reverse_weight=0.0
-    chunk_size=-1
-    ./tools/decode.sh --nj 16 \
-        --beam 15.0 --lattice_beam 7.5 --max_active 7000 \
-        --blank_skip_thresh 0.98 --ctc_weight 0.5 --rescoring_weight 1.0 \
-        --reverse_weight $reverse_weight --chunk_size $chunk_size \
-        --fst_path data/lang_test/TLG.fst \
-        data/test/wav.scp data/test/text $dir/final.zip \
-        data/lang_test/words.txt $dir/lm_with_runtime
-    # See $dir/lm_with_runtime for wer
-fi
-
-if [ ${stage} -le 8 ] && [ ${stop_stage} -ge 8 ]; then
-    # Test model, please specify the model you want to use by --checkpoint
-    # alignment input
-    ali_format=$feat_dir/test/format.data
-    # alignment output
-    ali_result=$dir/ali
-    python wenet/bin/alignment.py --gpu -1 \
-        --config $dir/train.yaml \
-        --input_file $ali_format \
-        --checkpoint $checkpoint \
-        --batch_size 1 \
-        --dict $dict \
-        --result_file $ali_result \
-        --gen_praat
-fi
-
