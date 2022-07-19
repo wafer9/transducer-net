@@ -29,7 +29,7 @@ import logging
 from pathlib import Path
 from typing import List, Tuple
 
-from lexicon import read_lexicon, write_lexicon
+from wenet.utils.lexicon import read_lexicon, write_lexicon
 
 
 def get_args():

@@ -35,7 +35,7 @@ from pathlib import Path
 import k2
 import torch
 
-from lexicon import Lexicon
+from wenet.utils.lexicon import Lexicon
 
 
 def get_args():
